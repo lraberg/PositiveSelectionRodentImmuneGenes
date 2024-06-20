@@ -1,0 +1,754 @@
+---
+title: "PositiveSelection"
+author: "Lars Råberg"
+date: '2023-11-21'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(car)
+library(emmeans)
+library(multcomp)
+citation("visreg")
+```
+
+#Data management
+```{r}
+#import results from PAML analyses
+PAML.df<-read_excel("pamlOP_lrt.xlsx")
+table(PAML.df$Category)
+str(PAML.df)
+PAML.df$M87_padj<-as.numeric(PAML.df$M87_padj)
+PAML.df$M21_padj<-as.numeric(PAML.df$M21_padj)
+PAML.df$PosSelM87=0
+PAML.df$PosSelM87[PAML.df$M87_padj<0.05] <-1
+PAML.df$PosSelM21=0
+PAML.df$PosSelM21[PAML.df$M21_padj<0.05] <-1
+
+table(PAML.df$PosSelM87, PAML.df$PosSelM21)
+table(PAML.df$Category, PAML.df$PosSelM87)
+table(PAML.df$Category, PAML.df$PosSelM21)
+
+#merge with list of Gene stable IDs
+#list of immune and control genes with alignments (N=1982): pamlOP_lrt_genes
+#obtain Protein stable IDs & Gene stable IDs from Biomart -> pamlOP_lrt_genes_ENSMUSP
+GenesProts.df<-read_excel("pamlOP_lrt_genes_ENSMUSP.xlsx")
+GenesProts.df<-subset(GenesProts.df, select=c("Gene_stable_ID", "Gene"))
+GenesProts.df<-unique(GenesProts.df)
+
+PAML.df<-merge(PAML.df, GenesProts.df, by="Gene")
+```
+
+
+```{r}
+#Get Protein Proetin Interactions (PPI)
+#download all interactions for Mus from STRING
+PPI.df<-read.table("10090.protein.links.detailed.v12.0.txt", header = TRUE)
+PPI.df$Protein<-gsub("^10090.", "", PPI.df$protein1)
+
+#select PPI with medium confidence (0.4=combined score≥400; use this level of confidence to get values >0 for most genes) and count cases 
+PPI_medconf.df<-subset(PPI.df, combined_score>=400)
+PPI_medconf_counts.df<-as.data.frame((table(PPI_medconf.df$Protein)))
+PPI_medconf_counts.df<-rename(PPI_medconf_counts.df, Protein = Var1)
+PPI_medconf_counts.df<-rename(PPI_medconf_counts.df, PPI_medconf=Freq)
+  
+#merge PPI with list of gene names
+#list of immune and control genes with alignments (N=1982): pamlOP_lrt_genes
+#obtain Protein stable IDs & Gene stable IDs from Biomart -> pamlOP_lrt_genes_ENSMUSP
+GenesProts_wProtein.df<-read_excel("pamlOP_lrt_genes_ENSMUSP.xlsx")
+PPI_medconf_genes.df<-merge(GenesProts_wProtein.df, PPI_medconf_counts.df, by="Protein", all=TRUE)
+PPI_medconf_genes_wPPI.df<-subset(PPI_medconf_genes.df, PPI_medconf > 0)
+PPI_medconf_ImmGen_Ctrl.df<-subset(PPI_medconf_genes_wPPI.df, Gene !="NA")
+#->PPI for 1968/1982 genes; use this estimate of PPI in analyses below. 
+#confirmed that #PPI correct by checking >10 genes in string-db.org
+
+#transformation of PPI
+str(PPI_medconf_ImmGen_Ctrl.df)
+hist(PPI_medconf_ImmGen_Ctrl.df$PPI_medconf)
+PPI_medconf_ImmGen_Ctrl.df$logPPI_medconf<-log10(PPI_medconf_ImmGen_Ctrl.df$PPI_medconf+1)
+hist(PPI_medconf_ImmGen_Ctrl.df$logPPI_medconf)
+
+```
+
+```{r}
+#Import list of genes with data on function
+ImmGenFunction.df<-read_excel("ImmGenFunction_20240520.xlsx")
+ImmGenFunction.df<-subset(ImmGenFunction.df, select=c(Gene, GeneStableID, Category1, Category2, Subcategory))
+table(ImmGenFunction.df$Category1)
+
+
+#ImmGenFunction_20240117.xlsx
+#CytoChemoRecept               Effector extracellProteaseInhib     intracellSignaling   otherCellSurfaceProt                    PRR 
+#            213                    116                     53                    471                    242                     77 
+
+#ImmGenFunction_20240520.xlsx
+#CytoChemoRecept               Effector extracellProteaseInhib     intracellSignaling   otherCellSurfaceProt                    PRR 
+#            211                    120                     53                    425                    229                     74 
+```
+
+```{r}
+#merge PAML, PPI and gene function
+ImmGenFunction_PAML.df<-merge(ImmGenFunction.df, PAML.df, by="Gene", all=TRUE)
+ImmGenFunction_PAML_PPI.df<-merge(ImmGenFunction_PAML.df, PPI_medconf_ImmGen_Ctrl.df, by="Gene", all=TRUE)
+PAML_GeneFunction.df<-subset(ImmGenFunction_PAML_PPI.df, PosSelM87 !="NA")
+PAML_GeneFunction.df$Category1[PAML_GeneFunction.df$Category == "Control"] <-"Control"
+
+#add 0 to logPPI w NA
+PAML_GeneFunction.df$logPPI_medconf[is.na(PAML_GeneFunction.df$logPPI_medconf)]<-0
+
+str(PAML_GeneFunction.df)
+PAML_GeneFunction.df<-subset(PAML_GeneFunction.df, select=c(Gene, Category1, Category2, Subcategory, M0_w, SequenceLength, Category, M87_padj, M21_padj, PosSelM87, PosSelM21, Gene_stable_ID.x, logPPI_medconf))
+PAML_GeneFunction.df<-rename(PAML_GeneFunction.df, GeneStableID=Gene_stable_ID.x)
+
+#transform sequence length
+hist(PAML_GeneFunction.df$SequenceLength)
+PAML_GeneFunction.df$logSeqL<-log10(PAML_GeneFunction.df$SequenceLength)
+hist(PAML_GeneFunction.df$logSeqL)
+
+write.csv(PAML_GeneFunction.df, "PAML_GeneFunction.csv")
+###START HERE###
+PAML_GeneFunction.df<-read.csv("PAML_GeneFunction.csv")
+
+```
+
+
+```{r}
+#Mus musculus gene expression from 10 organs
+#mean and median FPKM-TMM and Tau
+ExpressMusFPKM.df<-read_excel("mus.expression.tissues.xlsx")
+
+str(ExpressMusFPKM.df)
+ExpressMusFPKM.df$MUStau_fpkm_mean<-as.numeric(ExpressMusFPKM.df$MUStau_fpkm_mean)
+ExpressMusFPKM.df$MUStau_fpkm_median<-as.numeric(ExpressMusFPKM.df$MUStau_fpkm_median)
+ExpressMusFPKM.df$MUSmean_fpkm_all_samples<-as.numeric(ExpressMusFPKM.df$MUSmean_fpkm_all_samples)
+ExpressMusFPKM.df$MUSmedian_fpkm_all_samples<-as.numeric(ExpressMusFPKM.df$MUSmedian_fpkm_all_samples)
+
+#merge Mus expression data with other data
+PAML_GeneFunction_ExpressMus.df<-merge(PAML_GeneFunction.df, ExpressMusFPKM.df, by="GeneStableID")
+
+#transform Tau
+hist(PAML_GeneFunction_ExpressMus.df$MUStau_fpkm_mean)
+PAML_GeneFunction_ExpressMus.df$MUSasinTauFPKMmean<-asin(sqrt(PAML_GeneFunction_ExpressMus.df$MUStau_fpkm_mean))
+hist(PAML_GeneFunction_ExpressMus.df$MUSasinTauFPKMmean)
+#remove genes with normalized expression=0 in all tissues (N=10), as this->Tau=0
+PAML_GeneFunction_ExpressedMus.df<-subset(PAML_GeneFunction_ExpressMus.df, MUStau_fpkm_mean>0)
+#->N=1972
+hist(PAML_GeneFunction_ExpressedMus.df$MUSasinTauFPKMmean)
+
+hist(PAML_GeneFunction_ExpressedMus.df$MUStau_fpkm_median)
+PAML_GeneFunction_ExpressedMus.df$MUSasinTauFPKMmedian<-asin(sqrt(PAML_GeneFunction_ExpressedMus.df$MUStau_fpkm_median))
+hist(PAML_GeneFunction_ExpressedMus.df$MUSasinTauFPKMmedian)
+
+#transform mean and median
+hist(PAML_GeneFunction_ExpressedMus.df$MUSmean_fpkm_all_samples)
+PAML_GeneFunction_ExpressedMus.df$MUSlogFPKMmean<-log10(1+PAML_GeneFunction_ExpressedMus.df$MUSmean_fpkm_all_samples)
+hist(PAML_GeneFunction_ExpressedMus.df$MUSlogFPKMmean)
+
+hist(PAML_GeneFunction_ExpressedMus.df$MUSmedian_fpkm_all_samples)
+PAML_GeneFunction_ExpressedMus.df$MUSlogFPKMmedian<-log10(1+PAML_GeneFunction_ExpressedMus.df$MUSmedian_fpkm_all_samples)
+hist(PAML_GeneFunction_ExpressedMus.df$MUSlogFPKMmedian)
+
+#sample size
+table(PAML_GeneFunction_ExpressedMus.df$Category1)
+
+#corr matrix Mus
+ExpressedMUScorr<-subset(PAML_GeneFunction_ExpressedMus.df, select=c("MUSlogFPKMmean", "MUSlogFPKMmedian", "MUSasinTauFPKMmean", "MUSasinTauFPKMmedian"))
+panel.cor <- function(x, y, digits = 2, prefix = "", cex.cor, ...) {
+  usr <- par("usr")
+  on.exit(par(usr))
+  par(usr = c(0, 1, 0, 1))
+  r <- cor(x, y, use = "complete.obs", method="spearman")
+  txt <- format(c(r, 0.123456789), digits = digits)[1]
+  txt <- paste(prefix, txt, sep = "")
+  if (missing(cex.cor)) cex.cor <- 0.8/strwidth(txt)
+  text(0.5, 0.5, txt, cex =  cex.cor * (1 + abs(r)) / 3)
+}
+
+panel.hist <- function(x, ...) {
+  usr <- par("usr")
+  on.exit(par(usr))
+  par(usr = c(usr[1:2], 0, 1.5) )
+  h <- hist(x, plot = FALSE)
+  breaks <- h$breaks
+  nB <- length(breaks)
+  y <- h$counts
+  y <- y/max(y)
+  rect(breaks[-nB], 0, breaks[-1], y, col = "white", ...)
+}
+pairs(ExpressedMUScorr, upper.panel = panel.cor, diag.panel=panel.hist)
+
+```
+
+```{r}
+#Bank Vole gene expression from 10 organs (excluding bladder, as it is not in Mus data set)
+ExpressBV.df<-read.table("bv.expression.tissues.mouse_ids.without_bladder_samples.txt", header=TRUE)
+ExpressBV_FPKM.df<-subset(ExpressBV.df, select=c("gene", "mean_fpkm_all_samples", "median_fpkm_all_samples", "tau_fpkm_mean", "tau_fpkm_median"))
+
+ExpressBV_FPKM.df<-rename(ExpressBV_FPKM.df, GeneStableID=gene)
+ExpressBV_FPKM.df<-rename(ExpressBV_FPKM.df, BV_FPKMmean=mean_fpkm_all_samples)
+ExpressBV_FPKM.df<-rename(ExpressBV_FPKM.df, BV_FPKMmedian=median_fpkm_all_samples)
+ExpressBV_FPKM.df<-rename(ExpressBV_FPKM.df, BV_TauFPKMmean=tau_fpkm_mean)
+ExpressBV_FPKM.df<-rename(ExpressBV_FPKM.df, BV_TauFPKMmedian=tau_fpkm_median)
+
+#transform
+ExpressBV_FPKM.df$BVlogFPKMmean<-log10(1+ExpressBV_FPKM.df$BV_FPKMmean)
+ExpressBV_FPKM.df$BVlogFPKMmedian<-log10(1+ExpressBV_FPKM.df$BV_FPKMmedian)
+ExpressBV_FPKM.df$BVasinTauFPKMmean<-asin(sqrt(ExpressBV_FPKM.df$BV_TauFPKMmean))
+ExpressBV_FPKM.df$BVasinTauFPKMmedian<-asin(sqrt(ExpressBV_FPKM.df$BV_TauFPKMmedian))
+
+
+#merge BV expression data with other data 
+PAML_GeneFunction_ExpressedMusExpressBV.df<-merge(PAML_GeneFunction_ExpressedMus.df, ExpressBV_FPKM.df, by="GeneStableID")
+
+#remove genes with normalized expression=0 in all tissues in BV (N=23), as this->Tau=0
+PAML_GeneFunction_ExpressedMusBV.df<-subset(PAML_GeneFunction_ExpressedMusExpressBV.df, BV_FPKMmean>0)
+#->N=1774
+
+hist(PAML_GeneFunction_ExpressedMusBV.df$BVlogFPKMmean)
+hist(PAML_GeneFunction_ExpressedMusBV.df$MUSlogFPKMmean)
+hist(PAML_GeneFunction_ExpressedMusBV.df$BVasinTauFPKMmean)
+
+#sample size
+table(PAML_GeneFunction_ExpressedMusBV.df$Category1)
+
+#corr matrix BV
+ExpressedBVcorr<-subset(PAML_GeneFunction_ExpressedMusBV.df, select=c("BVlogFPKMmean", "BVlogFPKMmedian", "BVasinTauFPKMmean", "BVasinTauFPKMmedian"))
+panel.cor <- function(x, y, digits = 2, prefix = "", cex.cor, ...) {
+  usr <- par("usr")
+  on.exit(par(usr))
+  par(usr = c(0, 1, 0, 1))
+  r <- cor(x, y, use = "complete.obs", method="spearman")
+  txt <- format(c(r, 0.123456789), digits = digits)[1]
+  txt <- paste(prefix, txt, sep = "")
+  if (missing(cex.cor)) cex.cor <- 0.8/strwidth(txt)
+  text(0.5, 0.5, txt, cex =  cex.cor * (1 + abs(r)) / 3)
+}
+
+panel.hist <- function(x, ...) {
+  usr <- par("usr")
+  on.exit(par(usr))
+  par(usr = c(usr[1:2], 0, 1.5) )
+  h <- hist(x, plot = FALSE)
+  breaks <- h$breaks
+  nB <- length(breaks)
+  y <- h$counts
+  y <- y/max(y)
+  rect(breaks[-nB], 0, breaks[-1], y, col = "white", ...)
+}
+pairs(ExpressedBVcorr, upper.panel = panel.cor, diag.panel=panel.hist)
+
+
+#->use variables based on FPKM mean (because less skewed and substantially fewer lost cases in BV as compared to if variables based on median, although mean and Tau also less well correlated)
+
+```
+
+
+
+```{r}
+#corr matrix Mus-BV
+ExpressedMusBVcorr<-subset(PAML_GeneFunction_ExpressedMusBV.df, select=c("MUSlogFPKMmean", "MUSasinTauFPKMmean", "BVlogFPKMmean",  "BVasinTauFPKMmean"))
+panel.cor <- function(x, y, digits = 2, prefix = "", cex.cor, ...) {
+  usr <- par("usr")
+  on.exit(par(usr))
+  par(usr = c(0, 1, 0, 1))
+  r <- cor(x, y, use = "complete.obs", method="spearman")
+  txt <- format(c(r, 0.123456789), digits = digits)[1]
+  txt <- paste(prefix, txt, sep = "")
+  if (missing(cex.cor)) cex.cor <- 0.8/strwidth(txt)
+  text(0.5, 0.5, txt, cex =  cex.cor * (1 + abs(r)) / 3)
+}
+panel.hist <- function(x, ...) {
+  usr <- par("usr")
+  on.exit(par(usr))
+  par(usr = c(usr[1:2], 0, 1.5) )
+  h <- hist(x, plot = FALSE)
+  breaks <- h$breaks
+  nB <- length(breaks)
+  y <- h$counts
+  y <- y/max(y)
+  rect(breaks[-nB], 0, breaks[-1], y, col = "white", ...)
+}
+pairs(ExpressedMusBVcorr, upper.panel = panel.cor, diag.panel=panel.hist)
+
+```
+
+
+```{r}
+#compare FPKM in Mus and BV
+par(mfrow=c(1,2))
+boxplot(PAML_GeneFunction_ExpressedMusBV.df$MUSlogFPKMmean, ylim=c(0,4), ylab="MUSlogFPKMmean")
+boxplot(PAML_GeneFunction_ExpressedMusBV.df$BVlogFPKMmean, ylim=c(0,4), ylab="BVlogFPKMmean")
+```
+
+
+```{r}
+#sample size Mus & BV
+table(PAML_GeneFunction_ExpressedMusBV.df$Category1)
+```
+
+```{r}
+
+#sample size only Mus
+table(PAML_GeneFunction_ExpressedMus.df$Category1)
+```
+
+
+#Analyses with Mus and BV expression data
+```{r}
+#calculate mean expression and Tau across species
+PAML_GeneFunction_ExpressedMusBV.df$MusBVfpkm_mean<-((PAML_GeneFunction_ExpressedMusBV.df$MUSmean_fpkm_all_samples+PAML_GeneFunction_ExpressedMusBV.df$BV_FPKMmean)/2)
+PAML_GeneFunction_ExpressedMusBV.df$MusBVtau<-((PAML_GeneFunction_ExpressedMusBV.df$MUStau_fpkm_mean+PAML_GeneFunction_ExpressedMusBV.df$BV_TauFPKMmean)/2)
+PAML_GeneFunction_ExpressedMusBV.df$logMusBVfpkm_mean<-log10(PAML_GeneFunction_ExpressedMusBV.df$MusBVfpkm_mean+1)
+PAML_GeneFunction_ExpressedMusBV.df$asinMusBVtau<-asin(sqrt(PAML_GeneFunction_ExpressedMusBV.df$MusBVtau))
+hist(PAML_GeneFunction_ExpressedMusBV.df$logMusBVfpkm_mean)
+hist(PAML_GeneFunction_ExpressedMusBV.df$asinMusBVtau)
+
+#Z scores for predictor variables
+str(PAML_GeneFunction_ExpressedMusBV.df)
+PAML_GeneFunction_ExpressedMusBV.df$ZlogMusBVfpkm_mean<-as.numeric(scale(PAML_GeneFunction_ExpressedMusBV.df$logMusBVfpkm_mean))
+hist(PAML_GeneFunction_ExpressedMusBV.df$ZlogMusBVfpkm_mean)
+
+PAML_GeneFunction_ExpressedMusBV.df$ZasinMusBVtau<-as.numeric(scale(PAML_GeneFunction_ExpressedMusBV.df$asinMusBVtau))
+hist(PAML_GeneFunction_ExpressedMusBV.df$ZasinMusBVtau)
+
+PAML_GeneFunction_ExpressedMusBV.df$ZlogPPImedconf<-as.numeric(scale(PAML_GeneFunction_ExpressedMusBV.df$logPPI_medconf))
+hist(PAML_GeneFunction_ExpressedMusBV.df$ZlogPPImedconf)
+
+PAML_GeneFunction_ExpressedMusBV.df$ZlogSeqL<-as.numeric(scale(PAML_GeneFunction_ExpressedMusBV.df$logSeqL))
+hist(PAML_GeneFunction_ExpressedMusBV.df$ZlogSeqL)
+
+write.csv(PAML_GeneFunction_ExpressedMusBV.df, "PAML_GeneFunction_ExpressedMusBV.csv")
+```
+
+```{r}
+PAML_GeneFunction_ExpressedMusBV.df<-read.csv("PAML_GeneFunction_ExpressedMusBV.csv")
+
+#analyses
+str(PAML_GeneFunction_ExpressedMusBV.df)
+PAML_GeneFunction_ExpressedMusBV.df$M0_w<-as.numeric(PAML_GeneFunction_ExpressedMusBV.df$M0_w)
+PAML_GeneFunction_ExpressedMusBV.df$Category1<-factor(PAML_GeneFunction_ExpressedMusBV.df$Category1, levels=c("Control","PRR", "CytoChemoRecept", "otherCellSurfaceProt", "intracellSignaling", "extracellProteaseInhib", "Effector"))
+
+#analyses: dN/dS
+#boxplot
+par(mar=c(10, 5, 0.5, 1)) #default: par(mar=c(5.1, 4.1, 4.1, 2.1))
+boxplot(M0_w~Category1, data=PAML_GeneFunction_ExpressedMusBV.df, las=2, xlab="", ylab="dN/dS", names=c("Control", "PRR", "Cytokines & Recept.", "Other Surface Prot.", "Intracell. Signaling", "Extracell. Protease act.", "Effector"))
+
+#transform dN/dS
+hist(PAML_GeneFunction_ExpressedMusBV.df$M0_w)
+PAML_GeneFunction_ExpressedMusBV.df$sqrM0_w<-sqrt(PAML_GeneFunction_ExpressedMusBV.df$M0_w)
+str(PAML_GeneFunction_ExpressedMusBV.df)
+hist(PAML_GeneFunction_ExpressedMusBV.df$sqrM0_w)
+
+
+#differences in dNdS between gene categories?
+dNdS_sqrM0_w<-lm(sqrM0_w ~ Category1, data=PAML_GeneFunction_ExpressedMusBV.df)
+Anova(dNdS_sqrM0_w, type = c(3))
+summary(dNdS_sqrM0_w)
+plot(dNdS_sqrM0_w)
+
+
+#differences in dNdS between gene categories? Post hoc tests
+#dNdS_sqrM0_w_dun<-glht(dNdS_sqrM0_w, linfct = mcp(Category1 = "Dunnett"))
+#summary(dNdS_sqrM0_w_dun)
+
+dNdS_sqrM0_w_emm<-emmeans(dNdS_sqrM0_w, specs = trt.vs.ctrl~Category1, adjust="Dunnett")
+dNdS_sqrM0_w_emm
+
+```
+
+```{r}
+#correlates of dNdS in control genes?
+PAML_GeneFunction_ExpressedMusBV_ctrl.df<-subset(PAML_GeneFunction_ExpressedMusBV.df, Category1=="Control")
+
+dNdScorr<-subset(PAML_GeneFunction_ExpressedMusBV_ctrl.df, select=c("sqrM0_w", "logPPI_medconf", "logMusBVfpkm_mean", "asinMusBVtau", "logSeqL"))
+dNdScorr<-rename(dNdScorr, sqrtdNdS = sqrM0_w)
+dNdScorr<-rename(dNdScorr, logPPI = logPPI_medconf)
+dNdScorr<-rename(dNdScorr, logFPKM = logMusBVfpkm_mean)
+dNdScorr<-rename(dNdScorr, asinTau = asinMusBVtau)
+dNdScorr<-rename(dNdScorr, logSeqLength = logSeqL)
+
+panel.cor <- function(x, y, digits = 2, prefix = "", cex.cor, ...) {
+  usr <- par("usr")
+  on.exit(par(usr))
+  par(usr = c(0, 1, 0, 1))
+  r <- cor(x, y, use = "complete.obs", method="spearman")
+  txt <- format(c(r, 0.123456789), digits = digits)[1]
+  txt <- paste(prefix, txt, sep = "")
+  if (missing(cex.cor)) cex.cor <- 0.8/strwidth(txt)
+  text(0.5, 0.5, txt, cex =  cex.cor * (1 + abs(r)) / 3)
+}
+
+panel.hist <- function(x, ...) {
+  usr <- par("usr")
+  on.exit(par(usr))
+  par(usr = c(usr[1:2], 0, 1.5) )
+  h <- hist(x, plot = FALSE)
+  breaks <- h$breaks
+  nB <- length(breaks)
+  y <- h$counts
+  y <- y/max(y)
+  rect(breaks[-nB], 0, breaks[-1], y, col = "white", ...)
+}
+pairs(dNdScorr, upper.panel = panel.cor, diag.panel=panel.hist)
+
+
+dNdS_multreg<-lm(sqrM0_w~ZlogMusBVfpkm_mean+ZasinMusBVtau+ZlogPPImedconf+ZlogSeqL, data=PAML_GeneFunction_ExpressedMusBV_ctrl.df, )
+summary(dNdS_multreg, type=c(3))
+```
+
+```{r}
+#difference in dNdS between gene categories while controlling for potentially confounding factors 
+#w/o interactions
+dNdS_M0_w_cov<-lm(sqrM0_w ~ Category1 + ZlogMusBVfpkm_mean + ZlogPPImedconf + ZasinMusBVtau, data=PAML_GeneFunction_ExpressedMusBV.df)
+anova(dNdS_M0_w_cov)
+Anova(dNdS_M0_w_cov, type=c(3))
+
+#post hoc
+dNdS_M0_w_cov_emm<-emmeans(dNdS_M0_w_cov, specs = trt.vs.ctrl~Category1, adjust="Dunnett")
+dNdS_M0_w_cov_emm
+
+
+#with interactions
+dNdS_sqrM0_w_covx<-lm(sqrM0_w ~ Category1 + ZlogMusBVfpkm_mean + ZlogPPImedconf + ZasinMusBVtau + ZlogMusBVfpkm_mean:Category1 + ZlogPPImedconf:Category1 + ZasinMusBVtau:Category1, data=PAML_GeneFunction_ExpressedMusBV.df)
+Anova(dNdS_sqrM0_w_covx, type=c(3))
+
+dNdS_sqrM0_w_covx_red<-lm(sqrM0_w ~ Category1 + ZlogMusBVfpkm_mean + ZlogPPImedconf + ZasinMusBVtau + ZlogPPImedconf:Category1 + ZasinMusBVtau:Category1, data=PAML_GeneFunction_ExpressedMusBV.df)
+Anova(dNdS_sqrM0_w_covx_red, type=c(3))
+
+#post hoc
+dNdS_M0_w_covx_red_emm<-emmeans(dNdS_sqrM0_w_covx_red, specs = trt.vs.ctrl~Category1, adjust="Dunnett")
+dNdS_M0_w_covx_red_emm
+#NOTE: Results may be misleading due to involvement in interactions
+
+```
+
+```{r}
+#fig
+library(ggplot2)
+library(gridExtra)
+library(ggtext)
+library(RColorBrewer)
+PAML_GeneFunction_ExpressedMusBV_Cat1notNA.df<-subset(PAML_GeneFunction_ExpressedMusBV.df, Category1 !="NA")
+
+p0<-ggplot(PAML_GeneFunction_ExpressedMusBV_Cat1notNA.df, aes(x=Category1, y=M0_w, fill=Category1)) + geom_boxplot() + theme_classic() + theme(plot.tag = element_markdown(size=14), axis.text=element_markdown(size=14), axis.title = element_markdown(size=16)) + theme(legend.position = "none") + labs(tag="**A**", x="", y="dN/dS") + scale_x_discrete(labels=c("Ctrl", "PRR", "Cytokine", "Cell surf recept", "Signalling", "Protease", "Effector")) +  scale_fill_brewer(palette="Set2")
+
+p1<-ggplot(PAML_GeneFunction_ExpressedMusBV_Cat1notNA.df, aes(x=logPPI_medconf, y=sqrM0_w, color=Category1)) +
+  geom_point(size=0.3, alpha=0.2) + 
+  geom_smooth(method=lm, se=FALSE, size=0.5) + theme_classic() + labs(tag="**D**", x="log PPI", y="") + theme(legend.position = "none",  plot.tag = element_markdown(size=14), axis.text=element_markdown(size=14), axis.title = element_markdown(size=16)) + scale_color_brewer(palette="Set2")
+
+p2<-ggplot(PAML_GeneFunction_ExpressedMusBV_Cat1notNA.df, aes(x=asinMusBVtau, y=sqrM0_w, color=Category1)) +
+  geom_point(size=0.3, alpha=0.2) + 
+  geom_smooth(method=lm, se=FALSE, size=0.5) + theme_classic() + labs(tag="**C**", x="asin(sqrt(Tau))", y="") + theme(legend.position = "none",  plot.tag = element_markdown(size=14), axis.text=element_markdown(size=14), axis.title = element_markdown(size=16))+ scale_color_brewer(palette="Set2")
+
+p3<-ggplot(PAML_GeneFunction_ExpressedMusBV_Cat1notNA.df, aes(x=logMusBVfpkm_mean, y=sqrM0_w, color=Category1)) +
+  geom_point(size=0.3, alpha=0.2) + 
+  geom_smooth(method=lm, se=FALSE, size=0.5) + theme_classic() + labs(tag="**B**", x="log(mean fpkm)", y="sqrt(dN/dS)")+ theme(legend.position = "none",  plot.tag = element_markdown(size=14), axis.text=element_markdown(size=14), axis.title = element_markdown(size=16))+ scale_color_brewer(palette="Set2")
+
+grid.arrange(p0, arrangeGrob(p3, p2, p1, ncol=3), nrow=2)
+
+tiff("divergence_immunecatagories.tiff", res=300, width=12, height=9, units = "in")
+grid.arrange(p0, arrangeGrob(p3, p2, p1, ncol=3), nrow=2)
+dev.off()
+```
+
+
+```{r}
+
+#positively selected
+PAML_GeneFunction_ExpressedMusBV_Cat1notNA.df<-subset(PAML_GeneFunction_ExpressedMusBV.df, Category1 !="NA")
+xtab_M21M87<-table(PAML_GeneFunction_ExpressedMusBV_Cat1notNA.df$PosSelM21, PAML_GeneFunction_ExpressedMusBV_Cat1notNA.df$PosSelM87)
+print(xtab_M21M87)
+
+#M2 vs M1
+xtab_function_M21<-table(PAML_GeneFunction_ExpressedMusBV.df$PosSelM21, PAML_GeneFunction_ExpressedMusBV.df$Category1)
+print(xtab_function_M21)
+
+xtab_function_M21_prop<-prop.table(xtab_function_M21, 2)
+print(xtab_function_M21_prop)
+
+xtab_ImmCtrl_M21<-table(PAML_GeneFunction_ExpressedMusBV.df$PosSelM21, PAML_GeneFunction_ExpressedMusBV.df$Category)
+print(xtab_ImmCtrl_M21)
+
+xtab_ImmCtrl_M21_CatNotNA<-table(PAML_GeneFunction_ExpressedMusBV_Cat1notNA.df$PosSelM21, PAML_GeneFunction_ExpressedMusBV_Cat1notNA.df$Category)
+print(xtab_ImmCtrl_M21_CatNotNA)
+
+library(ggplot2)
+tabM21prop=as.data.frame(xtab_function_M21_prop)
+
+ggplot(tabM21prop, aes(x=Var2, y=Freq, fill=Var1)) + geom_col() + ylim(0,0.6) + labs(x="", y="Proportion postively selected") + theme_classic()+ theme(legend.position="none", axis.text.x = element_text(size=10, angle = 90, vjust = 0.5, hjust=1)) +  scale_x_discrete(labels=c("Control", "PRR", "Cytokines & Recept.", "Other Surface Prot.", "Intracell. Signal.", "Extracell. Protease act.", "Effector")) + scale_fill_manual(values=c("white", "darkgrey"))
+
+#M8 vs M7
+xtab_function_M87<-table(PAML_GeneFunction_ExpressedMusBV.df$PosSelM87, PAML_GeneFunction_ExpressedMusBV.df$Category1)
+print(xtab_function_M87)
+
+xtab_function_M87_prop<-prop.table(xtab_function_M87, 2)
+print(xtab_function_M87_prop)
+
+xtab_ImmCtrl_M87<-table(PAML_GeneFunction_ExpressedMusBV.df$PosSelM87, PAML_GeneFunction_ExpressedMusBV.df$Category)
+print(xtab_ImmCtrl_M87)
+
+xtab_ImmCtrl_M87_CatNotNA<-table(PAML_GeneFunction_ExpressedMusBV_Cat1notNA.df$PosSelM87, PAML_GeneFunction_ExpressedMusBV_Cat1notNA.df$Category)
+print(xtab_ImmCtrl_M87_CatNotNA)
+
+library(ggplot2)
+tabM87prop=as.data.frame(xtab_function_M87_prop)
+
+ggplot(tabM87prop, aes(x=Var2, y=Freq, fill=Var1)) + geom_col() + ylim(0,1) + labs(x="", y="Proportion postively selected") + theme_classic()+ theme(legend.position="none", axis.text.x = element_text(size=10, angle = 90, vjust = 0.5, hjust=1)) +  scale_x_discrete(labels=c("Control", "PRR", "Cytokines & Recept.", "Other Surface Prot.", "Intracell. Signal.", "Extracell. Protease act.", "Effector")) + scale_fill_manual(values=c("white", "darkgrey"))
+
+```
+
+```{r}
+
+#proportion of genes with signatures of Positive Selection in all categories; M2 vs M1
+PS<-glm(PosSelM21 ~ Category1, data = PAML_GeneFunction_ExpressedMusBV.df, family="binomial")
+Anova(PS, type = c(3))
+summary(PS)
+#deviance residuals should be centered on 0 and be symmetrical 
+#coefficient for factors is log(odds ratio) that that type of gene is subject to PS compared to control
+
+#post hoc
+PS_dun <-glht(PS, linfct = mcp(Category1 = "Dunnett"))
+summary(PS_dun)
+```
+
+```{r}
+#proportion of genes with signatures of Positive Selection in all categories; M8 vs M7
+PS_M87<-glm(PosSelM87 ~ Category1, data = PAML_GeneFunction_ExpressedMusBV.df, family="binomial")
+Anova(PS_M87, type = c(3))
+summary(PS_M87)
+#deviance residuals should be centered on 0 and be symmetrical 
+#coefficient for factors is log(odds ratio) that that type of gene is subject to PS compared to control
+
+#post hoc
+PS_M87_dun <-glht(PS_M87, linfct = mcp(Category1 = "Dunnett"))
+summary(PS_M87_dun)
+
+```
+
+
+
+```{r}
+#what determines positive selection in ctrl genes?
+#PAML_GeneFunction_ExpressedMusBV_ctrl.df<-subset(PAML_GeneFunction_ExpressedMus.df, Category.x=="Control")
+
+PS_ctrl<-glm(PosSelM21~ ZlogMusBVfpkm_mean + ZasinMusBVtau + ZlogPPImedconf + ZlogSeqL, data=PAML_GeneFunction_ExpressedMusBV_ctrl.df, family = "binomial")
+Anova(PS_ctrl, type=c(3))
+summary(PS_ctrl)
+
+#log reg with each predictor separately
+PS_ctrl_logFPKMmean<-glm(PosSelM21~logMusBVfpkm_mean, data=PAML_GeneFunction_ExpressedMusBV_ctrl.df, family = "binomial")
+summary(PS_ctrl_logFPKMmean)
+
+PS_ctrlTau<-glm(PosSelM21~asinMusBVtau, data=PAML_GeneFunction_ExpressedMusBV_ctrl.df, family = "binomial")
+summary(PS_ctrlTau)
+
+PS_ctrl_logPPI<-glm(PosSelM21~logPPI_medconf, data=PAML_GeneFunction_ExpressedMusBV_ctrl.df, family = "binomial")
+summary(PS_ctrl_logPPI)
+
+PS_ctrl_logSeqL<-glm(PosSelM21~logSeqL, data=PAML_GeneFunction_ExpressedMusBV_ctrl.df, family = "binomial")
+summary(PS_ctrl_logSeqL)
+
+library(visreg)
+par(mfrow=c(2,2))
+logreg_ctrl_logFPKM<-visreg(PS_ctrl_logFPKMmean, "logMusBVfpkm_mean", scale="response", rug=2, xlab="log mean FPKM", ylab="Positive Selection")
+
+logreg_ctrlTau<-visreg(PS_ctrlTau, "asinMusBVtau", scale="response", rug=2, xlab="asin(sqrt(Tau))", ylab="Positive Selection")
+
+logreg_ctrl_logPPI<-visreg(PS_ctrl_logPPI, "logPPI_medconf", scale="response", rug=2, xlab="log PPI", ylab="Positive Selection")
+
+logreg_ctrl_logSeqL<-visreg(PS_ctrl_logSeqL, "logSeqL", scale="response", rug=2, xlab="log sequence length", ylab="Positive Selection")
+
+```
+
+```{r}
+#proportion of genes with signatures of Positive Selection in different categories while controlling for confounding factors; M2 vs M1
+PS_cov<-glm(PosSelM21~Category1 + ZasinMusBVtau + ZlogPPImedconf + ZlogSeqL, data=PAML_GeneFunction_ExpressedMusBV.df, family = "binomial")
+Anova(PS_cov, type = c(3))
+summary(PS_cov)
+
+#post hoc
+PS_cov_dun <-glht(PS_cov, linfct = mcp(Category1 = "Dunnett"))
+summary(PS_cov_dun)
+
+#w interactions
+PS_covx<-glm(PosSelM21~Category1 + ZasinMusBVtau + ZlogPPImedconf + ZlogSeqL + ZasinMusBVtau:Category1 + ZlogPPImedconf:Category1 + ZlogSeqL:Category1, data=PAML_GeneFunction_ExpressedMusBV.df, family = "binomial")
+Anova(PS_covx, type = c(3))
+summary(PS_cov)
+
+PS_covx_red<-glm(PosSelM21~Category1 + ZasinMusBVtau + ZlogPPImedconf + ZlogSeqL + ZlogPPImedconf:Category1, data=PAML_GeneFunction_ExpressedMusBV.df, family = "binomial")
+Anova(PS_covx_red, type = c(3))
+PS_cov_dun_covx_red <-glht(PS_covx_red, linfct = mcp(Category1 = "Dunnett"))
+summary(PS_cov_dun_covx_red)
+
+```
+
+```{r}
+#fig with covariates; M2 vs M1
+logregP0<-ggplot(tabM21prop, aes(x=Var2, y=Freq, fill=Var2)) + geom_col(color="black") + ylim(0,0.6) + labs(x="", y="Proportion postively selected") + theme_classic()+ theme(legend.position="none", plot.tag = element_markdown(size=14), axis.text=element_markdown(size=14), axis.title = element_markdown(size=16)) +  scale_x_discrete(labels=c("Ctrl", "PRR", "Cytokine", "Cell surf prot", "Signalling", "Protease", "Effector")) + labs(tag="**A**")+ scale_fill_brewer(palette="Set2")
+
+logregP1<-visreg(PS_covx_red_notZ, "asinMusBVtau", by="Category1", overlay=TRUE, band=FALSE, scale="response", rug=2, xlab="asin(sqrt(Tau))", ylab="Positive Selection", legend=FALSE, gg=TRUE) + theme_classic() + theme(legend.position = "none", plot.tag = element_markdown(size=14), axis.text=element_markdown(size=14), axis.title = element_markdown(size=16)) + labs(tag="**B**")+ scale_color_brewer(palette="Set2")
+logregP2<-visreg(PS_covx_red_notZ, "logPPI_medconf", by="Category1", overlay=TRUE, band=FALSE, scale="response", rug=2, xlab="log(PPI)", ylab="", legend=FALSE, gg=TRUE) + theme_classic() + theme(legend.position = "none", plot.tag = element_markdown(size=14), axis.text=element_markdown(size=14), axis.title = element_markdown(size=16)) + labs(tag="**C**")+ scale_color_brewer(palette="Set2")
+logregP3<-visreg(PS_covx_red_notZ, "logSeqL", by="Category1", overlay=TRUE, band=FALSE, scale="response", rug=2, xlab="log(seq length)", ylab="", legend=FALSE, gg=TRUE) + theme_classic() + theme(legend.position = "none", plot.tag = element_markdown(size=14), axis.text=element_markdown(size=14), axis.title = element_markdown(size=16)) + labs(tag="**D**")+ scale_color_brewer(palette="Set2")
+
+grid.arrange(logregP0, arrangeGrob(logregP1, logregP2, logregP3, ncol=3), nrow=2)
+
+tiff("positiveSelection_immuneCategories.tiff", res=300, units="in",width=12, height=9)
+grid.arrange(logregP0, arrangeGrob(logregP1, logregP2, logregP3, ncol=3), nrow=2)
+dev.off()
+
+#log reg wo Z transformed values
+PS_covx_red_notZ<-glm(PosSelM21~Category1 + asinMusBVtau + logPPI_medconf + logSeqL + logPPI_medconf:Category1, data=PAML_GeneFunction_ExpressedMusBV.df, family = "binomial")
+Anova(PS_covx_red_notZ, type = c(3))
+
+#where are the PRRs?
+visreg(PS_covx_red_notZ, "asinMusBVtau", by="Category1", band=FALSE, scale="response", rug=2, xlab="asin(sqrt(Tau))", ylab="Positive Selection", legend=FALSE, gg=TRUE) + theme_classic() + theme(legend.position = "none") + labs(title="B")
+
+visreg(PS_covx_red_notZ, "logSeqL", by="Category1", band=FALSE, scale="response", rug=2, xlab="log(seq length)", ylab="", legend=FALSE, gg=TRUE) + theme_classic() + theme(legend.position = "none") + labs(title="D")
+
+```
+
+```{r}
+#proportion of genes with signatures of Positive Selection in different categories while controlling for confounding factors; M8 vs M7
+PS_M87_cov<-glm(PosSelM87~Category1 + ZasinMusBVtau + ZlogPPImedconf + ZlogSeqL, data=PAML_GeneFunction_ExpressedMusBV.df, family = "binomial")
+Anova(PS_M87_cov, type = c(3))
+summary(PS_M87_cov)
+
+#post hoc
+PS_M87_cov_dun <-glht(PS_M87_cov, linfct = mcp(Category1 = "Dunnett"))
+summary(PS_M87_cov_dun)
+
+#w interactions
+PS_M87_covx<-glm(PosSelM87~Category1 + ZasinMusBVtau + ZlogPPImedconf + ZlogSeqL + ZasinMusBVtau:Category1 + ZlogPPImedconf:Category1 + ZlogSeqL:Category1, data=PAML_GeneFunction_ExpressedMusBV.df, family = "binomial")
+Anova(PS_M87_covx, type = c(3))
+summary(PS_cov)
+```
+
+
+
+```{r}
+#PRR for cell wall components vs PRR for nucelic acids
+PAML_GeneFunction_ExpressedMusBV_PRR.df<-subset(PAML_GeneFunction_ExpressedMusBV.df, Category1=="PRR")
+
+# CORRECT ERROR (now corrected in input file): PAML_GeneFunction_ExpressedMusBV_PRR.df$Subcategory<-replace(PAML_GeneFunction_ExpressedMusBV_PRR.df$Subcategory, 34, "CellWallComponents")
+boxplot(M0_w~Subcategory, data=PAML_GeneFunction_ExpressedMusBV_PRR.df)
+
+dNdS_PRR<-lm(sqrM0_w~Subcategory, data=PAML_GeneFunction_ExpressedMusBV_PRR.df)
+Anova(dNdS_PRR, type=c(3))
+
+dNdS_PRR_cov<-lm(sqrM0_w~Subcategory + ZasinMusBVtau + ZlogMusBVfpkm_mean + ZlogPPImedconf + logSeqL, data=PAML_GeneFunction_ExpressedMusBV_PRR.df)
+Anova(dNdS_PRR_cov, type=c(3))
+
+dNdS_PRR_cov_red<-lm(sqrM0_w~Subcategory + ZasinMusBVtau + ZlogMusBVfpkm_mean, data=PAML_GeneFunction_ExpressedMusBV_PRR.df)
+Anova(dNdS_PRR_cov_red, type=c(3))
+
+
+tablePS_PRR<-table(PAML_GeneFunction_ExpressedMusBV_PRR.df$Subcategory, PAML_GeneFunction_ExpressedMusBV_PRR.df$PosSelM21)
+print(tablePS_PRR)
+chisq.test(tablePS_PRR)
+proptablePS_PRR<-prop.table(tablePS_PRR, 2)
+
+proptablePS_PRR.df=as.data.frame(proptablePS_PRR)
+ggplot(proptablePS_PRR.df, aes(x=Var2, y=Freq, fill=Var1)) + geom_col() + labs(x="", y="Proportion postively selected (M2 vs M1)") + theme_classic()+ theme(legend.position="none", axis.text.x = element_text(size=12))+  scale_x_discrete(labels=c("Cell wall components", "Nucleic acids")) + scale_fill_manual(values=c("white", "darkgrey")) + xlab("PRR ligand")
+
+
+PS_PRR<-glm(PosSelM21~Subcategory, data=PAML_GeneFunction_ExpressedMusBV_PRR.df, family="binomial")
+Anova(PS_PRR, type=c(3))
+
+PS_PRR_cov<-glm(PosSelM21~Subcategory + ZasinMusBVtau + ZlogMusBVfpkm_mean + ZlogPPImedconf + logSeqL, data=PAML_GeneFunction_ExpressedMusBV_PRR.df, family="binomial")
+Anova(PS_PRR_cov, type=c(3))
+
+
+```
+
+```{r}
+#Cytokines & chemokines vs their receptors
+PAML_GeneFunction_ExpressedMusBV_CCR.df<-subset(PAML_GeneFunction_ExpressedMusBV.df, Category1=="CytoChemoRecept")
+boxplot(M0_w~Subcategory, data=PAML_GeneFunction_ExpressedMusBV_CCR.df)
+
+dNdS_CCR<-lm(sqrM0_w~Subcategory, data=PAML_GeneFunction_ExpressedMusBV_CCR.df)
+Anova(dNdS_CCR, type=c(3))
+
+dNdS_CCR_cov<-lm(sqrM0_w~Subcategory + ZasinMusBVtau + ZlogMusBVfpkm_mean + ZlogPPImedconf + logSeqL, data=PAML_GeneFunction_ExpressedMusBV_CCR.df)
+Anova(dNdS_CCR_cov)
+
+dNdS_CCR_cov_red<-lm(sqrM0_w~Subcategory + ZMUSlogFPKMmean + logSeqL, data=PAML_GeneFunction_ExpressedMus_CCR.df)
+Anova(dNdS_CCR_cov_red)
+
+
+tablePS_CCR<-table(PAML_GeneFunction_ExpressedMusBV_CCR.df$Subcategory, PAML_GeneFunction_ExpressedMusBV_CCR.df$PosSelM21)
+print(tablePS_CCR)
+chisq.test(tablePS_CCR)
+proptablePS_CCR<-prop.table(tablePS_CCR, 2)
+
+proptablePS_CCR.df=as.data.frame(proptablePS_CCR)
+ggplot(proptablePS_CCR.df, aes(x=Var2, y=Freq, fill=Var1)) + geom_col() + labs(x="", y="Proportion postively selected (M2 vs M1)") + theme_classic()+ theme(legend.position="none", axis.text.x = element_text(size=12))+  scale_x_discrete(labels=c()) + scale_fill_manual(values=c("white", "darkgrey")) + xlab("PRR ligand")
+
+
+PS_CCR<-glm(PosSelM21~Subcategory, data=PAML_GeneFunction_ExpressedMusBV_CCR.df, family="binomial")
+Anova(PS_CCR, type=c(3))
+
+```
+
+```{r}
+#Effectors
+PAML_GeneFunction_ExpressedMusBV_Eff.df<-subset(PAML_GeneFunction_ExpressedMusBV.df, Category1=="Effector")
+
+PAML_GeneFunction_ExpressedMusBV_AMP_RF.df<-subset(PAML_GeneFunction_ExpressedMusBV.df, Subcategory=="AMP" | Subcategory=="RestrFact")
+
+table(PAML_GeneFunction_ExpressedMusBV_Eff.df$Subcategory)
+
+boxplot(M0_w~Subcategory, data=PAML_GeneFunction_ExpressedMusBV_AMP_RF.df)
+
+dNdS_AMP_RF<-lm(sqrM0_w~Subcategory, data=PAML_GeneFunction_ExpressedMusBV_AMP_RF.df)
+Anova(dNdS_AMP_RF, type=c(3))
+
+dNdS_AMP_RF_cov<-lm(sqrM0_w~Subcategory + ZasinMusBVtau + ZlogMusBVfpkm_mean + ZlogPPImedconf + logSeqL, data=PAML_GeneFunction_ExpressedMusBV_AMP_RF.df)
+Anova(dNdS_AMP_RF_cov, type=c(3))
+
+dNdS_AMP_RF_cov_red<-lm(sqrM0_w~Subcategory + ZlogPPImedconf, data=PAML_GeneFunction_ExpressedMusBV_AMP_RF.df)
+Anova(dNdS_AMP_RF_cov_red, type=c(3))
+
+
+
+tablePS_AMP_RF<-table(PAML_GeneFunction_ExpressedMusBV_AMP_RF.df$Subcategory, PAML_GeneFunction_ExpressedMusBV_AMP_RF.df$PosSelM21)
+print(tablePS_AMP_RF)
+proptablePS_AMP_RF<-prop.table(tablePS_AMP_RF, 2)
+print(proptablePS_AMP_RF)
+
+
+```
+
+```{r}
+#intracell signaling
+PAML_GeneFunction_ExpressedMusBV_IntraSign.df<-subset(PAML_GeneFunction_ExpressedMusBV.df, Category1=="intracellSignaling")
+table(PAML_GeneFunction_ExpressedMusBV_IntraSign.df$Category2)
+
+boxplot(M0_w~Category2, data=PAML_GeneFunction_ExpressedMusBV_IntraSign.df)
+
+dNdS_IntraSignM0<-lm(sqrM0_w~Category2, data=PAML_GeneFunction_ExpressedMusBV_IntraSign.df)
+Anova(dNdS_IntraSignM0, type=c(3))
+
+dNdS_IntraSignM0_emm<-emmeans(dNdS_IntraSignM0, specs = pairwise~Category2, adjust="Tukey")
+dNdS_IntraSignM0_emm
+
+dNdS_IntraSignM0_cov<-lm(sqrM0_w~Category2 + ZasinMusBVtau + ZlogMusBVfpkm_mean + ZlogPPImedconf + logSeqL, data=PAML_GeneFunction_ExpressedMusBV_IntraSign.df)
+Anova(dNdS_IntraSignM0_cov, type=c(3))
+
+dNdS_IntraSignM0_cov_red<-lm(sqrM0_w~Category2 + ZasinMusBVtau + ZlogMusBVfpkm_mean + ZlogPPImedconf, data=PAML_GeneFunction_ExpressedMusBV_IntraSign.df)
+Anova(dNdS_IntraSignM0_cov_red, type=c(3))
+
+dNdS_IntraSign_M0_cov_red_Tukey<-emmeans(dNdS_IntraSignM0_cov_red, specs = pairwise~Category2, adjust="Tukey")
+dNdS_IntraSign_M0_cov_red_Tukey
+
+PS_IntraSign<-glm(PosSelM21~Category2, data=PAML_GeneFunction_ExpressedMusBV_IntraSign.df, family="binomial")
+Anova(PS_IntraSign, type=c(3))
+
+```
+
